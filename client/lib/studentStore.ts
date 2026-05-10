@@ -1,10 +1,26 @@
+import { loginUserAccount, upsertStudentAccount } from "@/lib/authApi";
+import {
+  createAccessRequestApi,
+  listAccessRequestsApi,
+  updateAccessRequestApi,
+} from "@/lib/accessRequestApi";
+import { upsertAttendanceSqlApi } from "@/lib/attendanceSqlApi";
+import { generateStudentOtp, verifyStudentOtp } from "@/lib/authApi";
+import type { CreateStudentApiBody } from "@shared/api";
+import type { AccessRequestApiItem } from "@shared/api";
+
 export type StudentId = string;
 
 export type StudentDetails = {
   name: string;
   usn?: string;
-  parentName: string;
-  parentContact: string;
+  roomNumber?: string;
+  year?: string;
+  joiningYear?: number | null;
+  fatherName: string;
+  motherName: string;
+  fatherContact: string;
+  motherContact: string;
   studentContact: string;
   address: string;
   email: string;
@@ -12,6 +28,8 @@ export type StudentDetails = {
   joiningDate: string; // ISO date
   profilePhotoDataUrl?: string; // base64 preview
   documents?: { name: string; dataUrl: string }[];
+  parentName?: string; // legacy field for older localStorage records
+  parentContact?: string; // legacy field for older localStorage records
 };
 
 export type StudentCredentials = {
@@ -21,11 +39,12 @@ export type StudentCredentials = {
 
 export type StudentRecord = {
   id: StudentId;
+  student_id: StudentId;
   details: StudentDetails;
   credentials?: StudentCredentials; // optional until created
 };
 
-export type AccessStatus = "pending" | "approved";
+export type AccessStatus = "pending" | "approved" | "rejected";
 export type AccessRequest = {
   id: string;
   name: string;
@@ -34,6 +53,7 @@ export type AccessRequest = {
   status: AccessStatus;
   requestedAt: number;
   approvedAt?: number;
+  rejectedAt?: number;
 };
 
 const STORAGE_KEY = "campusstay.students.v1";
@@ -43,14 +63,148 @@ const ACCESS_SESSION_KEY = "campusstay.access.currentUsn.v1";
 function readAll(): StudentRecord[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as StudentRecord[]) : [];
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as Array<StudentRecord & { student_id?: StudentId }>;
+    // Migrate legacy records that only had `id` so each student keeps a stable unique key.
+    return parsed.map((student) => ({
+      ...student,
+      student_id: student.student_id ?? student.id,
+    }));
   } catch {
     return [];
   }
 }
 
+function stripStudentForCache(student: StudentRecord): StudentRecord {
+  return {
+    ...student,
+    details: {
+      ...student.details,
+      profilePhotoDataUrl: undefined,
+      documents: [],
+    },
+  };
+}
+
 function writeAll(students: StudentRecord[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(students));
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(students.map(stripStudentForCache)),
+  );
+}
+
+function toStudentApiPayload(record: StudentRecord): CreateStudentApiBody {
+  return {
+    id: record.student_id,
+    student_id: record.student_id,
+    roll_number: record.details.usn || record.student_id,
+    name: record.details.name,
+    usn: record.details.usn,
+    room_number: record.details.roomNumber,
+    year: record.details.year,
+    joining_year: record.details.joiningYear ?? undefined,
+    father_name: record.details.fatherName,
+    mother_name: record.details.motherName,
+    father_contact: record.details.fatherContact,
+    mother_contact: record.details.motherContact,
+    student_contact: record.details.studentContact,
+    address: record.details.address,
+    email: record.details.email,
+    total_amount: record.details.totalAmount ?? undefined,
+    joining_date: record.details.joiningDate || undefined,
+    profile_photo_data_url: record.details.profilePhotoDataUrl,
+    documents: record.details.documents,
+  };
+}
+
+export async function syncStudentRecordToSql(
+  record: StudentRecord,
+): Promise<void> {
+  const payload = toStudentApiPayload(record);
+  console.log("Syncing student to SQL with room_number:", payload.room_number);
+  
+  const response = await fetch("/api/students", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    console.error("SQL sync error response:", body);
+    throw new Error(body?.message || `SQL sync failed (HTTP ${response.status})`);
+  }
+  
+  console.log("Student synced successfully:", record.student_id, "room:", payload.room_number);
+}
+
+function mirrorStudentToSql(record: StudentRecord) {
+  void syncStudentRecordToSql(record)
+    .then(() => undefined)
+    .catch(() => {
+      console.warn(
+        "Failed to reach SQL Server while mirroring student record",
+        record.student_id,
+      );
+    });
+}
+
+export async function hydrateStudentsFromSql(): Promise<StudentRecord[]> {
+  try {
+    const response = await fetch("/api/students");
+    if (!response.ok) {
+      return listStudents();
+    }
+
+    const payload = (await response.json()) as
+      | { ok?: boolean; data?: StudentApiItem[] }
+      | StudentApiItem[];
+
+    const rows = Array.isArray(payload) ? payload : payload.data || [];
+    const existing = readAll();
+
+    const byStudentId = new Map(existing.map((record) => [record.student_id, record]));
+    const byUsn = new Map(
+      existing
+        .filter((record) => record.details.usn)
+        .map((record) => [record.details.usn!.trim().toUpperCase(), record]),
+    );
+
+    const hydrated: StudentRecord[] = rows.map((row) => {
+      const key = row.student_id || row.id;
+      const usnKey = (row.usn || "").trim().toUpperCase();
+      const prev = byStudentId.get(key) || byUsn.get(usnKey);
+
+      return normalizeLegacyYear({
+        id: key,
+        student_id: key,
+        credentials: prev?.credentials,
+        details: {
+          name: row.name || "",
+          usn: row.usn || undefined,
+          roomNumber: row.room_number || prev?.details.roomNumber,
+          year: row.year || "",
+          joiningYear: row.joining_year ?? null,
+          fatherName: row.father_name || "",
+          motherName: row.mother_name || "",
+          fatherContact: row.father_contact || "",
+          motherContact: row.mother_contact || "",
+          studentContact: row.student_contact || "",
+          address: row.address || "",
+          email: row.email || "",
+          totalAmount: row.total_amount ?? null,
+          joiningDate: row.joining_date || "",
+          profilePhotoDataUrl: row.profile_photo_data_url || prev?.details.profilePhotoDataUrl,
+          documents: prev?.details.documents || [],
+        },
+      });
+    });
+
+    writeAll(hydrated);
+    return hydrated;
+  } catch {
+    return [];
+  }
 }
 
 function uid() {
@@ -61,10 +215,52 @@ function normalizeUsn(usn: string) {
   return usn.trim().toUpperCase();
 }
 
+function normalizeYear(year?: string) {
+  const value = year?.trim();
+  return value || "";
+}
+
+function normalizeJoiningYear(joiningYear?: number | string | null) {
+  if (joiningYear === null || joiningYear === undefined || joiningYear === "") {
+    return null;
+  }
+  const parsed = typeof joiningYear === "number" ? joiningYear : Number(joiningYear);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function deriveYearFromJoiningYear(joiningYear?: number | null): string {
+  if (!joiningYear) return "";
+  const digit = String(joiningYear).slice(-1);
+  return digit === "1"
+    ? "1st Year"
+    : digit === "2"
+      ? "2nd Year"
+      : digit === "3"
+        ? "3rd Year"
+        : "4th Year";
+}
+
+function normalizeLegacyYear(student: StudentRecord): StudentRecord {
+  const year = normalizeYear(student.details.year || deriveYearFromJoiningYear(student.details.joiningYear));
+  const joiningYear = normalizeJoiningYear(
+    student.details.joiningYear ||
+      (student.details.joiningDate ? new Date(student.details.joiningDate).getFullYear() : null),
+  );
+  return {
+    ...student,
+    details: {
+      ...student.details,
+      year,
+      joiningYear,
+    },
+  };
+}
+
 function readAccessRequests(): AccessRequest[] {
   try {
     const raw = localStorage.getItem(ACCESS_REQUESTS_KEY);
-    return raw ? (JSON.parse(raw) as AccessRequest[]) : [];
+    const parsed = raw ? (JSON.parse(raw) as AccessRequest[]) : [];
+    return parsed.map(normalizeAccessRequest);
   } catch {
     return [];
   }
@@ -74,29 +270,88 @@ function writeAccessRequests(reqs: AccessRequest[]) {
   localStorage.setItem(ACCESS_REQUESTS_KEY, JSON.stringify(reqs));
 }
 
+function toMillis(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+    const date = Date.parse(value);
+    if (Number.isFinite(date)) return date;
+  }
+  return Date.now();
+}
+
+function normalizeAccessRequest(request: AccessRequest): AccessRequest {
+  return {
+    ...request,
+    usn: normalizeUsn(request.usn),
+    status: request.status,
+    requestedAt: toMillis(request.requestedAt),
+    approvedAt: request.approvedAt ? toMillis(request.approvedAt) : undefined,
+    rejectedAt: request.rejectedAt ? toMillis(request.rejectedAt) : undefined,
+  };
+}
+
+function fromAccessRequestApi(item: AccessRequestApiItem): AccessRequest {
+  return normalizeAccessRequest({
+    id: item.id,
+    name: item.name,
+    usn: item.usn,
+    phone: item.phone,
+    status: item.status,
+    requestedAt: new Date(item.requestedAt).getTime(),
+    approvedAt: item.approvedAt ? new Date(item.approvedAt).getTime() : undefined,
+    rejectedAt: item.rejectedAt ? new Date(item.rejectedAt).getTime() : undefined,
+  });
+}
+
+function replaceAccessRequestInCache(request: AccessRequest) {
+  const all = readAccessRequests();
+  const idx = all.findIndex((item) => item.id === request.id);
+  if (idx >= 0) all[idx] = normalizeAccessRequest(request);
+  else all.push(normalizeAccessRequest(request));
+  writeAccessRequests(all);
+}
+
+export async function hydrateAccessRequestsFromSql() {
+  try {
+    const items = await listAccessRequestsApi();
+    writeAccessRequests(items.map(fromAccessRequestApi));
+  } catch {
+    // Keep the local cache usable if SQL is unavailable.
+  }
+}
+
 export function listStudents(): StudentRecord[] {
-  return readAll();
+  return readAll().map(normalizeLegacyYear);
 }
 
 export function getStudent(id: StudentId): StudentRecord | undefined {
-  return readAll().find((s) => s.id === id);
+  const found = readAll().find((s) => s.student_id === id || s.id === id);
+  return found ? normalizeLegacyYear(found) : undefined;
 }
 
 export function findStudentByUsername(
   username: string,
 ): StudentRecord | undefined {
   const u = username.trim().toLowerCase();
-  return readAll().find((s) => s.credentials?.username.toLowerCase() === u);
+  return readAll().find(
+    (s) =>
+      s.credentials?.username.toLowerCase() === u ||
+      s.details.usn?.trim().toLowerCase() === u,
+  );
 }
 
 const SESSION_KEY = "campusstay.session.studentId.v1";
-export function authenticateStudent(
+export async function authenticateStudent(
   username: string,
   password: string,
-): StudentRecord | null {
+): Promise<StudentRecord | null> {
+  const result = await loginUserAccount({ username, password, role: "student" });
+  if (!result.ok) return null;
+
   const s = findStudentByUsername(username);
-  if (!s || !s.credentials) return null;
-  if (s.credentials.password !== password) return null;
+  if (!s) return null;
   localStorage.setItem(SESSION_KEY, s.id);
   return s;
 }
@@ -129,11 +384,15 @@ export function listPendingAccessRequests(): AccessRequest[] {
     .sort((a, b) => b.requestedAt - a.requestedAt);
 }
 
-export function submitAccessRequest(input: {
+export function listAccessRequests(): AccessRequest[] {
+  return readAccessRequests().sort((a, b) => b.requestedAt - a.requestedAt);
+}
+
+export async function submitAccessRequest(input: {
   name: string;
   usn: string;
   phone: string;
-}): AccessRequest {
+}): Promise<AccessRequest> {
   const name = input.name.trim();
   const usn = normalizeUsn(input.usn);
   const phone = input.phone.trim();
@@ -141,34 +400,34 @@ export function submitAccessRequest(input: {
     throw new Error("Name, USN and phone number are required");
   }
 
-  const req: AccessRequest = {
-    id: uid(),
-    name,
-    usn,
-    phone,
-    status: "pending",
-    requestedAt: Date.now(),
-  };
+  const existing = getLatestAccessRequestByUsn(usn);
+  if (existing && existing.status !== "approved") {
+    throw new Error("This USN already has a pending or denied access request.");
+  }
 
-  const all = readAccessRequests();
-  all.push(req);
-  writeAccessRequests(all);
+  const created = fromAccessRequestApi(
+    await createAccessRequestApi({ name, usn, phone }),
+  );
+  replaceAccessRequestInCache(created);
   localStorage.setItem(ACCESS_SESSION_KEY, usn);
-  return req;
+  return created;
 }
 
-export function approveAccessRequest(id: string): AccessRequest {
-  const all = readAccessRequests();
-  const idx = all.findIndex((r) => r.id === id);
-  if (idx === -1) throw new Error("Request not found");
-  all[idx] = {
-    ...all[idx],
-    status: "approved",
-    approvedAt: Date.now(),
-  };
-  writeAccessRequests(all);
-  ensureStudentRecordForUsn(all[idx].usn, all[idx].name, all[idx].phone);
-  return all[idx];
+export async function approveAccessRequest(id: string): Promise<AccessRequest> {
+  const updated = fromAccessRequestApi(
+    await updateAccessRequestApi(id, { status: "approved" }),
+  );
+  replaceAccessRequestInCache(updated);
+  ensureStudentRecordForUsn(updated.usn, updated.name, updated.phone);
+  return updated;
+}
+
+export async function rejectAccessRequest(id: string): Promise<AccessRequest> {
+  const updated = fromAccessRequestApi(
+    await updateAccessRequestApi(id, { status: "rejected" }),
+  );
+  replaceAccessRequestInCache(updated);
+  return updated;
 }
 
 export function resetAccessToPending(usn: string) {
@@ -192,23 +451,47 @@ export function resetAccessToPending(usn: string) {
 
 export function upsertStudent(record: StudentRecord): StudentRecord {
   const all = readAll();
-  const idx = all.findIndex((s) => s.id === record.id);
-  if (idx >= 0) all[idx] = record;
-  else all.push(record);
+  const idx = all.findIndex(
+    (s) =>
+      s.student_id === record.student_id ||
+      s.id === record.id ||
+      (record.details.usn && s.details.usn === record.details.usn),
+  );
+  const normalized: StudentRecord = {
+    ...record,
+    id: record.student_id,
+    details: {
+      ...record.details,
+      year: normalizeYear(record.details.year),
+      joiningYear: normalizeJoiningYear(record.details.joiningYear),
+    },
+  };
+  if (idx >= 0) all[idx] = normalized;
+  else all.push(normalized);
   writeAll(all);
-  return record;
+  mirrorStudentToSql(normalized);
+  return normalized;
 }
 
 export function createStudent(
   details: Partial<StudentDetails> & { name: string },
 ): StudentRecord {
+  const studentId = uid();
+  const joiningYear = normalizeJoiningYear(details.joiningYear);
+  const year = normalizeYear(details.year || deriveYearFromJoiningYear(joiningYear));
   const record: StudentRecord = {
-    id: uid(),
+    id: studentId,
+    student_id: studentId,
     details: {
       name: details.name,
       usn: details.usn,
-      parentName: details.parentName ?? "",
-      parentContact: details.parentContact ?? "",
+      roomNumber: details.roomNumber,
+      year,
+      joiningYear,
+      fatherName: details.fatherName ?? details.parentName ?? "",
+      motherName: details.motherName ?? "",
+      fatherContact: details.fatherContact ?? details.parentContact ?? "",
+      motherContact: details.motherContact ?? "",
       studentContact: details.studentContact ?? "",
       address: details.address ?? "",
       email: details.email ?? "",
@@ -221,12 +504,19 @@ export function createStudent(
   return upsertStudent(record);
 }
 
-export function setCredentials(id: StudentId, creds: StudentCredentials) {
+export async function setCredentials(id: StudentId, creds: StudentCredentials) {
   const all = readAll();
-  const idx = all.findIndex((s) => s.id === id);
+  const idx = all.findIndex((s) => s.student_id === id || s.id === id);
   if (idx === -1) throw new Error("Student not found");
   all[idx] = { ...all[idx], credentials: creds };
   writeAll(all);
+  if (creds.username.trim() && creds.password) {
+    await upsertStudentAccount({
+      studentId: all[idx].student_id,
+      username: creds.username,
+      password: creds.password,
+    });
+  }
 }
 
 export function ensureStudentRecordForUsn(
@@ -250,7 +540,6 @@ export function ensureStudentRecordForUsn(
     usn: normalizedUsn,
     studentContact: fallbackPhone,
   });
-  setCredentials(created.id, { username: normalizedUsn, password: "" });
   return getStudent(created.id)!;
 }
 
@@ -264,17 +553,23 @@ export function saveStudentDetailsByUsn(
     patch.name,
     patch.studentContact,
   );
-  updateDetails(record.id, { ...patch, usn: normalizedUsn });
+  updateDetails(record.id, {
+    ...patch,
+    usn: normalizedUsn,
+    year: normalizeYear(patch.year),
+    joiningYear: normalizeJoiningYear(patch.joiningYear),
+  });
   return getStudent(record.id)!;
 }
 
 export function getStudentByUsn(usn: string): StudentRecord | undefined {
-  return findStudentByUsername(normalizeUsn(usn));
+  const found = findStudentByUsername(normalizeUsn(usn));
+  return found ? normalizeLegacyYear(found) : undefined;
 }
 
-export function resetPassword(id: StudentId, newPassword: string) {
+export async function resetPassword(id: StudentId, newPassword: string) {
   const all = readAll();
-  const idx = all.findIndex((s) => s.id === id);
+  const idx = all.findIndex((s) => s.student_id === id || s.id === id);
   if (idx === -1) throw new Error("Student not found");
   const current = all[idx];
   all[idx] = {
@@ -284,6 +579,13 @@ export function resetPassword(id: StudentId, newPassword: string) {
       : undefined,
   };
   writeAll(all);
+  if (all[idx].credentials?.username && newPassword) {
+    await upsertStudentAccount({
+      studentId: all[idx].student_id,
+      username: all[idx].credentials.username,
+      password: newPassword,
+    });
+  }
 }
 
 export type StudentPublicView = {
@@ -300,10 +602,19 @@ export function getStudentPublic(id: StudentId): StudentPublicView | undefined {
 
 export function updateDetails(id: StudentId, patch: Partial<StudentDetails>) {
   const all = readAll();
-  const idx = all.findIndex((s) => s.id === id);
+  const idx = all.findIndex((s) => s.student_id === id || s.id === id);
   if (idx === -1) throw new Error("Student not found");
-  all[idx] = { ...all[idx], details: { ...all[idx].details, ...patch } };
+  all[idx] = {
+    ...all[idx],
+    details: {
+      ...all[idx].details,
+      ...patch,
+      year: normalizeYear(patch.year ?? all[idx].details.year),
+      joiningYear: normalizeJoiningYear(patch.joiningYear ?? all[idx].details.joiningYear),
+    },
+  };
   writeAll(all);
+  mirrorStudentToSql(all[idx]);
   const current = getCurrentStudentId();
   if (current === id) {
     // keep session id intact
@@ -402,6 +713,14 @@ function writeRecords(r: AttendanceRecord[]) {
   localStorage.setItem(RECORDS_KEY, JSON.stringify(r));
 }
 
+async function syncAttendanceToSql(record: AttendanceRecord) {
+  await upsertAttendanceSqlApi({
+    studentId: record.studentId,
+    dateKey: record.dateKey,
+    status: record.status,
+  });
+}
+
 export function getHostelSettings(): HostelSettings | null {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -454,7 +773,13 @@ export function createAttendanceSession({
 
 export function getActiveAttendanceSession(): AttendanceSession | null {
   const now = Date.now();
-  return readSessions().find((s) => now < s.expiresAt && !s.locked) || null;
+  const activeSessions = readSessions().filter((s) => now < s.expiresAt && !s.locked);
+  // Return the most recently created session (highest createdAt timestamp)
+  return activeSessions.length > 0
+    ? activeSessions.reduce((latest, current) => 
+        current.createdAt > latest.createdAt ? current : latest
+      )
+    : null;
 }
 
 export function lockAttendance(date: string) {
@@ -487,6 +812,9 @@ export function setManualPresence(
   if (idx >= 0) recs[idx] = { ...recs[idx], ...base };
   else recs.push(base);
   writeRecords(recs);
+  void syncAttendanceToSql(base).catch(() => {
+    console.warn("Failed to mirror attendance to SQL Server", studentId, date);
+  });
 }
 
 export function finalizeAttendance(date: string) {
@@ -515,6 +843,11 @@ export function finalizeAttendance(date: string) {
   }
   writeRecords(recs);
   lockAttendance(date);
+  for (const record of recs.filter((r) => r.dateKey === date)) {
+    void syncAttendanceToSql(record).catch(() => {
+      console.warn("Failed to mirror attendance to SQL Server", record.studentId, date);
+    });
+  }
 }
 
 export function markAttendanceWithToken(
@@ -542,6 +875,9 @@ export function markAttendanceWithToken(
   if (idx >= 0) recs[idx] = { ...recs[idx], ...base };
   else recs.push(base);
   writeRecords(recs);
+  void syncAttendanceToSql(base).catch(() => {
+    console.warn("Failed to mirror attendance to SQL Server", studentId, session.dateKey);
+  });
   return base;
 }
 
@@ -1052,4 +1388,94 @@ export function skippedMealsCount(
     if (p.responses[studentId] === "not") count++;
   }
   return count;
+}
+
+// -------------------- Student OTP Login & Session --------------------
+const STUDENT_SESSION_KEY = "campusstay.student.session.v1";
+const STUDENT_OTP_REQUEST_KEY = "campusstay.student.otp.request.v1";
+const STUDENT_OTP_DEBUG_KEY = "campusstay.student.otp.debug.v1";
+
+export type StudentLoginSession = {
+  studentId: string;
+  usn: string;
+  token: string;
+  loginTime: number;
+};
+
+export async function requestStudentOtp(usn: string): Promise<string | undefined> {
+  const normalized = usn.trim().toUpperCase();
+  try {
+    const response = await generateStudentOtp({ usn: normalized });
+    const messageOtpMatch = response.message?.match(/\b(\d{6})\b/);
+    const debugOtp = response.debugOtp || messageOtpMatch?.[1] || undefined;
+    localStorage.setItem(STUDENT_OTP_REQUEST_KEY, JSON.stringify({ usn: normalized, requestedAt: Date.now() }));
+    if (debugOtp) {
+      localStorage.setItem(
+        STUDENT_OTP_DEBUG_KEY,
+        JSON.stringify({ usn: normalized, otp: debugOtp, requestedAt: Date.now() }),
+      );
+    } else {
+      localStorage.removeItem(STUDENT_OTP_DEBUG_KEY);
+    }
+    return debugOtp;
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function verifyAndLoginStudent(usn: string, otp: string): Promise<StudentLoginSession> {
+  const normalized = usn.trim().toUpperCase();
+  try {
+    const result = await verifyStudentOtp({ usn: normalized, otp });
+    const session: StudentLoginSession = {
+      studentId: result.studentId,
+      usn: normalized,
+      token: result.token,
+      loginTime: Date.now(),
+    };
+    localStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(session));
+    localStorage.removeItem(STUDENT_OTP_REQUEST_KEY);
+    return session;
+  } catch (error) {
+    throw error;
+  }
+}
+
+export function getCurrentStudentSession(): StudentLoginSession | null {
+  try {
+    const raw = localStorage.getItem(STUDENT_SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StudentLoginSession;
+  } catch {
+    return null;
+  }
+}
+
+export function logoutStudentSession(): void {
+  localStorage.removeItem(STUDENT_SESSION_KEY);
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(ACCESS_SESSION_KEY);
+}
+
+export function getLastRequestedStudentOtpDebug(): string | null {
+  try {
+    const raw = localStorage.getItem(STUDENT_OTP_DEBUG_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { otp?: string };
+    return parsed.otp || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function requestRemoveStudentAccount(studentId: string): Promise<void> {
+  // Reset access to pending so warden can review removal request
+  const existing = getStudent(studentId);
+  if (!existing) return;
+
+  const usn = existing.details.usn;
+  if (!usn) return;
+
+  resetAccessToPending(usn);
+  logoutStudentSession();
 }

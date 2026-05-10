@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
-import { GraduationCap, Shield, ArrowRight, Sparkles } from "lucide-react";
+import { GraduationCap, Shield, ArrowRight, Sparkles, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -76,7 +76,7 @@ export default function Index() {
               </DialogDescription>
             </DialogHeader>
 
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <LoginOption
                 title="Login as Student"
                 description="Quick access to your passes, requests, and updates."
@@ -104,6 +104,21 @@ export default function Index() {
                   });
                   setOpen(false);
                   navigate("/warden");
+                }}
+              />
+
+              <LoginOption
+                title="Login as Admin"
+                description="Manage students, notifications, and warden access."
+                icon={<ShieldCheck className="h-6 w-6" />}
+                gradient="from-cyan-500 via-blue-600 to-indigo-500"
+                onClick={() => {
+                  toast({
+                    title: "Admin login",
+                    description: "Proceeding as Admin.",
+                  });
+                  setOpen(false);
+                  navigate("/admin");
                 }}
               />
             </div>

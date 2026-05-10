@@ -131,7 +131,9 @@ export function WardenParcelsPanel() {
                         ) as HTMLInputElement
                       )?.value;
                       const res = markCollectedWithOtp(p.id, otp || "");
-                      if (!res.ok) alert(res.error);
+                      if (!res.ok) {
+                        alert("error" in res ? res.error : "Invalid OTP");
+                      }
                       setNow(Date.now());
                     }}
                   >

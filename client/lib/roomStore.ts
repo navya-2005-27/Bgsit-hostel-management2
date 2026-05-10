@@ -1,4 +1,5 @@
 import type { StudentId } from "./studentStore";
+import { updateDetails } from "./studentStore";
 
 export type RoomId = string;
 export type RequestId = string;
@@ -76,8 +77,15 @@ export function createRoom(name: string, capacity = 2): Room {
 }
 
 export function deleteRoom(id: RoomId) {
-  const all = readRooms().filter((r) => r.id !== id);
-  writeRooms(all);
+  const all = readRooms();
+  const removed = all.find((r) => r.id === id);
+  if (removed) {
+    removed.occupants.forEach((studentId) => {
+      updateDetails(studentId, { roomNumber: "" });
+    });
+  }
+  const next = all.filter((r) => r.id !== id);
+  writeRooms(next);
 }
 
 export function setRoomCapacity(id: RoomId, capacity: number) {
@@ -107,7 +115,12 @@ export function findStudentRoom(studentId: StudentId): Room | null {
 
 export function resetAllBookings() {
   const all = readRooms();
-  for (const r of all) r.occupants = [];
+  for (const r of all) {
+    for (const studentId of r.occupants) {
+      updateDetails(studentId, { roomNumber: "" });
+    }
+    r.occupants = [];
+  }
   writeRooms(all);
 }
 
@@ -125,6 +138,7 @@ export function bookRoom(
   r.occupants.push(studentId);
   all[idx] = r;
   writeRooms(all);
+  updateDetails(studentId, { roomNumber: r.name });
   return { room: r, roommates: r.occupants.filter((id) => id !== studentId) };
 }
 
@@ -135,6 +149,7 @@ export function unbookStudent(studentId: StudentId) {
     if (i !== -1) {
       r.occupants.splice(i, 1);
       writeRooms(all);
+      updateDetails(studentId, { roomNumber: "" });
       return;
     }
   }
@@ -155,6 +170,7 @@ export function moveStudent(studentId: StudentId, targetRoomId: RoomId) {
   // add to new
   all[toIdx].occupants.push(studentId);
   writeRooms(all);
+  updateDetails(studentId, { roomNumber: all[toIdx].name });
 }
 
 // Requests

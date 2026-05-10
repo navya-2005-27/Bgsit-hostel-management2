@@ -172,7 +172,9 @@ export function WardenRoomsPanel() {
                       size="sm"
                       onClick={() => {
                         const res = approveRequest(rq.id);
-                        if (!res.ok) alert(res.error);
+                        if (!res.ok) {
+                          alert("error" in res ? res.error : "Unable to approve request");
+                        }
                         setNow(Date.now());
                       }}
                     >

@@ -11,7 +11,9 @@
     ]
   },
   "scripts": {
-    "dev": "vite",
+    "dev": "node dev.mjs",
+    "dev:client": "vite",
+    "dev:server": "tsx server/dev.ts",
     "build": "npm run build:client && npm run build:server",
     "build:client": "vite build",
     "build:server": "vite build --config vite.config.server.ts",
@@ -24,7 +26,9 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "i": "^0.3.7",
-    "mongoose": "^8.18.1",
+    "mssql": "^11.0.1",
+    "qrcode": "^1.5.4",
+    "xlsx": "^0.18.5",
     "zod": "^3.25.76"
   },
   "devDependencies": {

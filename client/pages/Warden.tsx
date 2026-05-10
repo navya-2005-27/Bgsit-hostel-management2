@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
+import QRCode from "qrcode";
+import * as XLSX from "xlsx";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 import {
   Card,
   CardContent,
@@ -21,14 +24,19 @@ import {
   QrCode,
   Bell,
   PieChart,
+  Users,
+  Clock,
+  Download,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 import {
   StudentRecord,
   StudentId,
   listPendingAccessRequests,
+  listAccessRequests,
   approveAccessRequest,
+  rejectAccessRequest,
   listStudents,
+  hydrateStudentsFromSql,
   createStudent,
   setCredentials,
   resetPassword,
@@ -97,9 +105,24 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { WardenRoomsPanel } from "./components.rooms.warden";
 import { WardenParcelsPanel } from "./components.parcels.warden";
+import { StudentManagementPanel } from "@/components/StudentManagementPanel";
+import { NotificationCenter } from "@/components/NotificationCenter";
+import { StudentTablePanel } from "@/components/StudentTablePanel";
+import { NotificationCenterV2 } from "@/components/NotificationCenterV2";
+import {
+  authenticateWarden,
+  isWardenLoggedIn,
+  logoutWarden,
+} from "@/lib/adminStore";
+import { useNavigate } from "react-router-dom";
 
 export default function Warden() {
+  const navigate = useNavigate();
   const { toast } = useToast();
+  const [isLoggedIn, setIsLoggedIn] = useState(() => isWardenLoggedIn());
+  const [wardenUsername, setWardenUsername] = useState("");
+  const [wardenPassword, setWardenPassword] = useState("");
+  const [activeTab, setActiveTab] = useState("access");
   const [students, setStudents] = useState<StudentRecord[]>([]);
   const [selectedId, setSelectedId] = useState<StudentId | "new" | "">("");
   const [showPassword, setShowPassword] = useState(false);
@@ -113,11 +136,17 @@ export default function Warden() {
   const [pendingAccess, setPendingAccess] = useState(() =>
     listPendingAccessRequests(),
   );
+  const [accessHistory, setAccessHistory] = useState(() => listAccessRequests());
+  const [accessHistorySearch, setAccessHistorySearch] = useState("");
+  const [accessHistoryBlock, setAccessHistoryBlock] = useState("all");
 
   // Attendance state
   const [session, setSession] = useState<AttendanceSession | null>(
     getActiveAttendanceSession(),
   );
+  const [qrImageUrl, setQrImageUrl] = useState<string>("");
+  const [selectedAttendanceDate, setSelectedAttendanceDate] = useState<string>(getDateKey());
+  const [selectedBlock, setSelectedBlock] = useState<string>("all");
   const [isSendingNotifications, setIsSendingNotifications] = useState(false);
   const [now, setNow] = useState(Date.now());
   const [settings, setSettings] = useState<HostelSettings | null>(
@@ -134,12 +163,20 @@ export default function Warden() {
   );
 
   useEffect(() => {
-    setStudents(listStudents());
+    void hydrateStudentsFromSql().then((rows) => setStudents(rows));
   }, []);
 
   useEffect(() => {
     if (studentName && !username) setUsername(suggestUsername(studentName));
   }, [studentName, username]);
+
+  useEffect(() => {
+    const refreshStudents = () => {
+      void hydrateStudentsFromSql().then((rows) => setStudents(rows));
+    };
+    window.addEventListener("student-data-updated", refreshStudents);
+    return () => window.removeEventListener("student-data-updated", refreshStudents);
+  }, []);
 
   useEffect(() => {
     const i = setInterval(() => {
@@ -148,18 +185,121 @@ export default function Warden() {
       setWeeklyActive(getActiveWeeklyPoll());
       setActiveDayPolls(getActiveDailyMealPolls());
       setPendingAccess(listPendingAccessRequests());
+      setAccessHistory(listAccessRequests());
     }, 1000);
     return () => clearInterval(i);
   }, []);
+
+  // Generate QR code whenever session changes
+  useEffect(() => {
+    if (!session || !session.token) {
+      setQrImageUrl("");
+      return;
+    }
+    
+    QRCode.toDataURL(session.token, {
+      width: 220,
+      margin: 2,
+      color: {
+        dark: "#000000",
+        light: "#ffffff",
+      },
+    })
+      .then((url) => {
+        console.log("QR generated successfully for token:", session.token);
+        setQrImageUrl(url);
+      })
+      .catch((error) => {
+        console.error("QR generation failed:", error);
+        setQrImageUrl("");
+      });
+  }, [session?.id, session?.token]);
 
   const selected = useMemo(
     () => students.find((s) => s.id === selectedId),
     [students, selectedId],
   );
 
-  const refresh = () => setStudents(listStudents());
+  // Deduplicate access history by USN (keep latest), add room numbers, group by block
+  const processedAccessHistory = useMemo(() => {
+    const deduped = new Map();
+    const parseRoom = (room: string) => {
+      if (room === "—") return { block: "Z", num: Infinity };
+      const match = room.match(/^([A-Z])[-\s]?(\d+)$/i);
+      if (match) {
+        return { block: match[1].toUpperCase(), num: parseInt(match[2], 10) };
+      }
+      return { block: "Z", num: Infinity };
+    };
+    
+    // Keep only the latest entry for each USN
+    accessHistory.forEach((req) => {
+      const existing = deduped.get(req.usn);
+      if (!existing || new Date(req.requestedAt) > new Date(existing.requestedAt)) {
+        deduped.set(req.usn, req);
+      }
+    });
 
-  function handleCreateLogin() {
+    let history = Array.from(deduped.values());
+
+    // Add room number from student details
+    history = history.map((req) => {
+      const student = students.find(
+        (s) => (s.details?.usn || "").toUpperCase() === (req.usn || "").toUpperCase()
+      );
+      return {
+        ...req,
+        roomNumber: student?.details?.roomNumber || "—",
+      };
+    });
+
+    // Filter by search (name or USN only)
+    if (accessHistorySearch.trim()) {
+      const search = accessHistorySearch.toLowerCase();
+      history = history.filter(
+        (req) =>
+          req.name.toLowerCase().includes(search) ||
+          req.usn.toLowerCase().includes(search)
+      );
+    }
+
+    if (accessHistoryBlock !== "all") {
+      history = history.filter((req) => {
+        const roomData = parseRoom(req.roomNumber);
+        return roomData.block === accessHistoryBlock;
+      });
+    }
+
+    const grouped = new Map<string, typeof history>();
+    history.forEach((item) => {
+      const roomData = parseRoom(item.roomNumber);
+      const block = roomData.block;
+      if (!grouped.has(block)) {
+        grouped.set(block, []);
+      }
+      grouped.get(block)!.push(item);
+    });
+
+    // Sort each group by room number and return as array of { block, items }
+    const blocks = ["A", "B", "C", "D", "Z"];
+    return blocks
+      .map((block) => {
+        const items = grouped.get(block) || [];
+        items.sort((a, b) => {
+          const roomA = parseRoom(a.roomNumber);
+          const roomB = parseRoom(b.roomNumber);
+          return roomA.num - roomB.num;
+        });
+        return { block, items };
+      })
+      .filter((g) => g.items.length > 0);
+  }, [accessHistory, students, accessHistorySearch, accessHistoryBlock]);
+
+  const refresh = () => {
+    void hydrateStudentsFromSql().then((rows) => setStudents(rows));
+  };
+
+  async function handleCreateLogin() {
     const name = studentName.trim();
     if (!name) {
       toast({
@@ -172,14 +312,22 @@ export default function Warden() {
     const pass = password || generatePassword();
 
     const record = createStudent({ name });
-    setCredentials(record.id, { username: user, password: pass });
-    refresh();
-    setSelectedId(record.id);
-    setShowPassword(false);
-    toast({ title: "Login created", description: `Roll number: ${user}` });
+    try {
+      await setCredentials(record.id, { username: user, password: pass });
+      refresh();
+      setSelectedId(record.id);
+      setShowPassword(false);
+      toast({ title: "Login created", description: `Roll number: ${user}` });
+    } catch (error: any) {
+      toast({
+        title: "Could not create login",
+        description: error?.message || "Failed to sync student credentials.",
+        variant: "destructive",
+      });
+    }
   }
 
-  function handleResetPassword() {
+  async function handleResetPassword() {
     if (!selected) {
       toast({
         title: "Select a student",
@@ -188,10 +336,18 @@ export default function Warden() {
       return;
     }
     const pass = generatePassword();
-    resetPassword(selected.id, pass);
-    refresh();
-    setShowPassword(false);
-    toast({ title: "Password reset", description: `New password generated.` });
+    try {
+      await resetPassword(selected.id, pass);
+      refresh();
+      setShowPassword(false);
+      toast({ title: "Password reset", description: `New password generated.` });
+    } catch (error: any) {
+      toast({
+        title: "Could not reset password",
+        description: error?.message || "Failed to sync student password.",
+        variant: "destructive",
+      });
+    }
   }
 
   // ----- Attendance helpers
@@ -208,6 +364,25 @@ export default function Warden() {
   function startSession() {
     const s = createAttendanceSession();
     setSession(s);
+    
+    // Generate QR code immediately
+    QRCode.toDataURL(s.token, {
+      width: 220,
+      margin: 2,
+      color: {
+        dark: "#000000",
+        light: "#ffffff",
+      },
+    })
+      .then((url) => {
+        console.log("QR generated immediately:", url.substring(0, 50) + "...");
+        setQrImageUrl(url);
+      })
+      .catch((error) => {
+        console.error("QR generation failed immediately:", error);
+        setQrImageUrl("");
+      });
+    
     toast({ title: "QR generated", description: "Valid for 1 hour." });
   }
 
@@ -239,10 +414,12 @@ export default function Warden() {
     const targets = absentees
       .map((s) => ({
         name: s.details.name,
-        phone: (s.details.parentContact || s.details.studentContact).replace(
-          /[^0-9]/g,
-          "",
-        ),
+        phone: (
+          s.details.fatherContact ||
+          s.details.motherContact ||
+          s.details.parentContact ||
+          s.details.studentContact
+        ).replace(/[^0-9]/g, ""),
       }))
       .filter((x) => x.phone);
 
@@ -284,22 +461,113 @@ export default function Warden() {
     }
   }
 
-  return (
-    <div className="min-h-screen bg-gradient-to-b from-background to-white dark:to-background">
-      <div className="mx-auto max-w-6xl px-6 py-10">
-        <div className="mb-8 flex items-center gap-3">
-          <Shield className="h-6 w-6 text-primary" />
-          <h1 className="text-2xl font-bold">Warden Section</h1>
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-background to-white dark:to-background">
+        <div className="mx-auto grid min-h-screen max-w-md place-items-center px-6 py-10">
+          <Card className="w-full">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Shield className="h-5 w-5 text-primary" /> Warden Login
+              </CardTitle>
+              <CardDescription>
+                Sign in with credentials set by Admin.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <Label>Username</Label>
+                <Input
+                  value={wardenUsername}
+                  onChange={(e) => setWardenUsername(e.target.value)}
+                  placeholder="warden"
+                />
+              </div>
+              <div>
+                <Label>Password</Label>
+                <Input
+                  type="password"
+                  value={wardenPassword}
+                  onChange={(e) => setWardenPassword(e.target.value)}
+                  placeholder="Enter password"
+                />
+              </div>
+              <Button
+                className="w-full"
+                onClick={async () => {
+                  try {
+                    const ok = await authenticateWarden(wardenUsername, wardenPassword);
+                    if (!ok) {
+                      toast({
+                        title: "Invalid warden credentials",
+                        description: "Please check username and password.",
+                        variant: "destructive",
+                      });
+                      return;
+                    }
+                    setIsLoggedIn(true);
+                    toast({ title: "Welcome, Warden" });
+                  } catch (error: any) {
+                    toast({
+                      title: "Could not sign in",
+                      description: error?.message || "Login validation failed.",
+                      variant: "destructive",
+                    });
+                  }
+                }}
+              >
+                Login as Warden
+              </Button>
+            </CardContent>
+          </Card>
         </div>
+      </div>
+    );
+  }
 
-        <Tabs defaultValue="access" className="w-full">
-          <TabsList>
-            <TabsTrigger value="access">Access Requests</TabsTrigger>
-            <TabsTrigger value="attendance">Attendance Management</TabsTrigger>
-          </TabsList>
+  return (
+    <div className="min-h-screen overflow-x-hidden bg-gradient-to-b from-background to-white dark:to-background pb-28 md:pb-0">
+      <div className="mx-auto w-full max-w-6xl px-4 py-4 sm:px-6 sm:py-10">
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+          <div className="sticky top-0 z-30 -mx-4 mb-5 hidden border-b border-border bg-background/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:block md:-mx-6 md:px-6 md:py-4">
+            <div className="flex items-start justify-between gap-2 md:items-center md:gap-3">
+              <div className="flex min-w-0 items-center gap-2 md:gap-3">
+                <Shield className="h-5 w-5 shrink-0 text-primary md:h-6 md:w-6" />
+                <h1 className="truncate text-lg font-bold md:text-2xl">Warden Section</h1>
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  logoutWarden();
+                  setIsLoggedIn(false);
+                }}
+              >
+                Logout
+              </Button>
+            </div>
+            <TabsList className="mt-4 w-full flex-wrap justify-start gap-2 rounded-full bg-muted/95 p-1 backdrop-blur supports-[backdrop-filter]:bg-muted/80">
+              <TabsTrigger value="access">Access Requests</TabsTrigger>
+              <TabsTrigger value="students">Students</TabsTrigger>
+              <TabsTrigger value="notifications">Notifications</TabsTrigger>
+              <TabsTrigger value="attendance">Attendance Management</TabsTrigger>
+            </TabsList>
+          </div>
+
+          <TabsContent value="notifications" className="mt-4 sm:mt-6">
+            <NotificationCenterV2 canPost canDelete />
+          </TabsContent>
+
+          <TabsContent value="students" className="mt-4 sm:mt-6">
+            <StudentTablePanel
+              students={students}
+              onViewDetails={(student: StudentRecord) => {
+                navigate(`/warden/student/${student.id}`);
+              }}
+            />
+          </TabsContent>          
 
           {/* Access Requests */}
-          <TabsContent value="access" className="mt-6">
+          <TabsContent value="access" className="mt-4 sm:mt-6">
             <Card>
               <CardHeader>
                 <CardTitle>Incoming Student Access Requests</CardTitle>
@@ -313,7 +581,7 @@ export default function Warden() {
                   pendingAccess.map((req) => (
                     <div
                       key={req.id}
-                      className="rounded-md border p-3 text-sm flex items-center justify-between gap-3"
+                      className="rounded-md border p-3 text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3"
                     >
                       <div>
                         <div className="font-medium">{req.name}</div>
@@ -324,27 +592,55 @@ export default function Warden() {
                           Requested {new Date(req.requestedAt).toLocaleString()}
                         </div>
                       </div>
-                      <Button
-                        onClick={() => {
-                          try {
-                            approveAccessRequest(req.id);
-                            setPendingAccess(listPendingAccessRequests());
-                            refresh();
-                            toast({
-                              title: "Request approved",
-                              description: `${req.name} can now complete profile details.`,
-                            });
-                          } catch (e: any) {
-                            toast({
-                              title: "Could not approve",
-                              description: e?.message || "Unknown error",
-                              variant: "destructive",
-                            });
-                          }
-                        }}
-                      >
-                        Accept
-                      </Button>
+                      <div className="flex gap-2 w-full sm:w-auto">
+                        <Button
+                          onClick={async () => {
+                            try {
+                              await approveAccessRequest(req.id);
+                              setPendingAccess(listPendingAccessRequests());
+                              setAccessHistory(listAccessRequests());
+                              refresh();
+                              toast({
+                                title: "Request approved",
+                                description: `${req.name} can now complete profile details.`,
+                              });
+                            } catch (e: any) {
+                              toast({
+                                title: "Could not approve",
+                                description: e?.message || "Unknown error",
+                                variant: "destructive",
+                              });
+                            }
+                          }}
+                          className="flex-1 sm:flex-none"
+                        >
+                          Accept
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          onClick={async () => {
+                            try {
+                              await rejectAccessRequest(req.id);
+                              setPendingAccess(listPendingAccessRequests());
+                              setAccessHistory(listAccessRequests());
+                              refresh();
+                              toast({
+                                title: "Request denied",
+                                description: `${req.name} has been denied access.`,
+                              });
+                            } catch (e: any) {
+                              toast({
+                                title: "Could not deny",
+                                description: e?.message || "Unknown error",
+                                variant: "destructive",
+                              });
+                            }
+                          }}
+                          className="flex-1 sm:flex-none"
+                        >
+                          Deny
+                        </Button>
+                      </div>
                     </div>
                   ))
                 ) : (
@@ -352,6 +648,78 @@ export default function Warden() {
                     No pending access requests.
                   </div>
                 )}
+
+                <div className="pt-4 border-t space-y-4">
+                  <div className="space-y-3">
+                    <div className="text-sm font-medium">Recent Decisions & History</div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Input
+                        placeholder="Search by name or USN..."
+                        value={accessHistorySearch}
+                        onChange={(e) => setAccessHistorySearch(e.target.value)}
+                        className="h-9 text-sm"
+                      />
+                      <select
+                        value={accessHistoryBlock}
+                        onChange={(e) => setAccessHistoryBlock(e.target.value)}
+                        className="h-9 rounded-md border bg-background px-3 text-sm"
+                      >
+                        <option value="all">All blocks</option>
+                        <option value="A">Block A</option>
+                        <option value="B">Block B</option>
+                        <option value="C">Block C</option>
+                        <option value="D">Block D</option>
+                        <option value="Z">Unassigned</option>
+                      </select>
+                    </div>
+                  </div>
+                  {processedAccessHistory.length ? (
+                    processedAccessHistory.map((group) => (
+                      <div key={`block-${group.block}`} className="space-y-2">
+                        <div className="text-sm font-semibold text-primary">
+                          {group.block === "Z" ? "Unassigned" : `Block ${group.block}`}
+                        </div>
+                        <div className="space-y-2 pl-2 border-l-2 border-primary/30">
+                          {group.items.slice(0, 10).map((req: any) => (
+                            <div
+                              key={`${req.id}-history`}
+                              className="rounded-md border px-3 py-2 text-sm flex flex-col gap-1"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-medium">{req.name}</span>
+                                <span
+                                  className={cn("text-xs font-medium capitalize", {
+                                    "text-amber-600": req.status === "pending",
+                                    "text-green-600": req.status === "approved",
+                                    "text-destructive": req.status === "rejected",
+                                  })}
+                                >
+                                  {req.status}
+                                </span>
+                              </div>
+                              <div className="text-muted-foreground text-xs">
+                                USN: {req.usn} | Room: {req.roomNumber} | Requested {new Date(req.requestedAt).toLocaleString()}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {req.approvedAt
+                                  ? `Approved ${new Date(req.approvedAt).toLocaleString()}`
+                                  : req.rejectedAt
+                                  ? `Denied ${new Date(req.rejectedAt).toLocaleString()}`
+                                  : "Waiting for warden review."}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-muted-foreground">
+                      {accessHistory.length === 0
+                        ? "No access request history yet."
+                        : "No results matching your search."}
+                    </div>
+                  )}
+                </div>
               </CardContent>
             </Card>
           </TabsContent>
@@ -724,7 +1092,7 @@ export default function Warden() {
                         <img
                           alt="QR"
                           className="mx-auto aspect-square h-52 w-52"
-                          src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(session.token)}`}
+                          src={qrImageUrl || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Crect fill='%23f0f0f0' width='220' height='220'/%3E%3Ctext x='50%25' y='50%25' text-anchor='middle' dy='.3em' fill='%23999' font-size='14'%3EGenerating QR...%3C/text%3E%3C/svg%3E"}
                         />
                         <div className="mt-2 text-sm text-muted-foreground">
                           Expires in {countdown}
@@ -851,69 +1219,215 @@ export default function Warden() {
                 <CardHeader>
                   <CardTitle>Attendance Sheet</CardTitle>
                   <CardDescription>
-                    Toggle present/absent. Submitting locks for the day.
+                    Select a date, toggle present/absent, and export to Excel.
                   </CardDescription>
                 </CardHeader>
-                <CardContent>
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    {students.map((s) => {
-                      const present = presentSet.has(s.id);
-                      return (
-                        <div
-                          key={s.id}
-                          className="flex items-center justify-between rounded-md border p-3"
-                        >
-                          <div className="min-w-0">
-                            <div className="truncate font-medium">
-                              {s.details.name}
-                            </div>
-                            <div className="truncate text-xs text-muted-foreground">
-                              Roll: {s.credentials?.username || "-"}
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <Button
-                              size="sm"
-                              variant={present ? "default" : "outline"}
-                              onClick={() =>
-                                setManualPresence(activeDate, s.id, true)
-                              }
-                            >
-                              Present
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant={!present ? "destructive" : "outline"}
-                              onClick={() =>
-                                setManualPresence(activeDate, s.id, false)
-                              }
-                            >
-                              Absent
-                            </Button>
-                          </div>
-                        </div>
-                      );
-                    })}
+                <CardContent className="space-y-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:gap-4">
+                    <div>
+                      <Label htmlFor="attendance-date">Select Date</Label>
+                      <Input
+                        id="attendance-date"
+                        type="date"
+                        value={selectedAttendanceDate}
+                        onChange={(e) => setSelectedAttendanceDate(e.target.value)}
+                        className="mt-1"
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor="attendance-block">Block</Label>
+                      <select
+                        id="attendance-block"
+                        className="h-10 rounded-md border bg-background px-3 text-sm mt-1"
+                        value={selectedBlock}
+                        onChange={(e) => setSelectedBlock(e.target.value)}
+                      >
+                        <option value="all">All Blocks</option>
+                        <option value="A">Block A</option>
+                        <option value="B">Block B</option>
+                        <option value="C">Block C</option>
+                        <option value="D">Block D</option>
+                      </select>
+                    </div>
+                    <Button
+                      onClick={() => {
+                        const attendanceData = listAttendanceForDate(selectedAttendanceDate);
+                        const presentSet = new Set(
+                          attendanceData.filter((a) => a.status === "present").map((a) => a.studentId)
+                        );
+
+                        const exportRows: any[] = [];
+                        const roomMap = new Map<string, typeof students>();
+
+                        students.forEach((s) => {
+                          const room = s.details.roomNumber || "Unassigned";
+                          if (!roomMap.has(room)) {
+                            roomMap.set(room, []);
+                          }
+                          roomMap.get(room)!.push(s);
+                        });
+
+                        function roomBlock(room: string) {
+                          const m = String(room || "").trim().match(/^([A-Za-z])/);
+                          const b = m ? m[1].toUpperCase() : "";
+                          if (["A","B","C","D"].includes(b)) return b;
+                          return "Z"; // Unassigned
+                        }
+
+                        const filteredRooms = Array.from(roomMap.keys()).filter((r) => {
+                          if (selectedBlock === "all") return true;
+                          return roomBlock(r) === selectedBlock;
+                        });
+
+                        const sortedRooms = filteredRooms.sort((a, b) => {
+                          if (a === "Unassigned") return 1;
+                          if (b === "Unassigned") return -1;
+                          return a.localeCompare(b, undefined, { numeric: true });
+                        });
+
+                        sortedRooms.forEach((room) => {
+                          const roomStudents = roomMap.get(room) || [];
+                          roomStudents.forEach((s) => {
+                            const present = presentSet.has(s.id);
+                            exportRows.push({
+                              Room: room,
+                              Name: s.details.name,
+                              USN: s.details.usn || s.credentials?.username || "-",
+                              Status: present ? "Present" : "Absent",
+                            });
+                          });
+                        });
+
+                        const ws = XLSX.utils.json_to_sheet(exportRows);
+                        const wb = XLSX.utils.book_new();
+                        XLSX.utils.book_append_sheet(wb, ws, "Attendance");
+                        XLSX.writeFile(wb, `attendance_${selectedAttendanceDate}.xlsx`);
+                        toast({ title: "Exported", description: "Attendance data exported to Excel." });
+                      }}
+                    >
+                      Download Excel
+                    </Button>
                   </div>
 
-                  {session ? (
-                    <Button onClick={submitAttendance} className="mt-4">
+                  <div className="space-y-4">
+                    {useMemo(() => {
+                      const attendanceData = listAttendanceForDate(selectedAttendanceDate);
+                      const presentSet = new Set(
+                        attendanceData.filter((a) => a.status === "present").map((a) => a.studentId)
+                      );
+
+                      const roomMap = new Map<string, typeof students>();
+                      students.forEach((s) => {
+                        const room = s.details.roomNumber || "Unassigned";
+                        if (!roomMap.has(room)) {
+                          roomMap.set(room, []);
+                        }
+                        roomMap.get(room)!.push(s);
+                      });
+
+                      function roomBlock(room: string) {
+                        const m = String(room || "").trim().match(/^([A-Za-z])/);
+                        const b = m ? m[1].toUpperCase() : "";
+                        if (["A","B","C","D"].includes(b)) return b;
+                        return "Z";
+                      }
+
+                      const filteredRooms = Array.from(roomMap.keys())
+                        .filter((r) => selectedBlock === "all" ? true : roomBlock(r) === selectedBlock)
+                        .sort((a, b) => {
+                          if (a === "Unassigned") return 1;
+                          if (b === "Unassigned") return -1;
+                          return a.localeCompare(b, undefined, { numeric: true });
+                        });
+
+                      return filteredRooms.map((room) => {
+                        const roomStudents = roomMap.get(room) || [];
+                        const present = roomStudents.filter((s) => presentSet.has(s.id)).length;
+
+                        return (
+                          <div key={room} className="rounded-lg border p-3 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="font-semibold text-sm">
+                                {room}
+                                <span className="ml-2 text-xs text-muted-foreground">
+                                  {present}/{roomStudents.length} present
+                                </span>
+                              </h4>
+                            </div>
+                            <div className="space-y-1.5 sm:grid sm:grid-cols-2 sm:gap-2 sm:space-y-0">
+                              {roomStudents.map((s) => {
+                                const isPresent = presentSet.has(s.id);
+                                return (
+                                  <div
+                                    key={s.id}
+                                    className="flex items-center justify-between rounded-md bg-muted/50 p-2"
+                                  >
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-sm font-medium">
+                                        {s.details.name}
+                                      </div>
+                                      <div className="truncate text-xs text-muted-foreground">
+                                        {s.details.usn || s.credentials?.username || "-"}
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center gap-1 flex-shrink-0">
+                                      <Button
+                                        size="sm"
+                                        variant={isPresent ? "default" : "outline"}
+                                        onClick={() =>
+                                          setManualPresence(selectedAttendanceDate, s.id, true)
+                                        }
+                                        className="h-7 px-2 text-xs"
+                                      >
+                                        P
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant={!isPresent ? "destructive" : "outline"}
+                                        onClick={() =>
+                                          setManualPresence(selectedAttendanceDate, s.id, false)
+                                        }
+                                        className="h-7 px-2 text-xs"
+                                      >
+                                        A
+                                      </Button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      });
+                    }, [selectedAttendanceDate, students, now, selectedBlock])}
+                  </div>
+
+                  {session && selectedAttendanceDate === activeDate ? (
+                    <Button onClick={submitAttendance} className="w-full">
                       Submit Attendance
                     </Button>
                   ) : null}
 
-                  {absentees.length ? (
-                    <div className="mt-6">
-                      <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-                        <Bell className="h-4 w-4" /> Parent Notifications
-                      </div>
-                      <div className="rounded-md border p-3">
+                  {useMemo(() => {
+                    if (selectedAttendanceDate !== activeDate) return null;
+                    const attendanceData = listAttendanceForDate(selectedAttendanceDate);
+                    const presentSet = new Set(
+                      attendanceData.filter((a) => a.status === "present").map((a) => a.studentId)
+                    );
+                    const absentCount = students.length - presentSet.size;
+                    
+                    if (!absentCount) return null;
+                    
+                    return (
+                      <div className="rounded-md border p-3 space-y-3">
+                        <div className="flex items-center gap-2 text-sm font-medium">
+                          <Bell className="h-4 w-4" /> Parent Notifications
+                        </div>
                         <div className="text-sm text-muted-foreground">
-                          {absentees.length} absent student(s) will receive the
-                          same configured note for today.
+                          {absentCount} absent student(s) will receive notification for today.
                         </div>
                         <Button
-                          className="mt-3"
+                          className="w-full"
                           onClick={sendAllParentNotifications}
                           disabled={isSendingNotifications}
                         >
@@ -922,8 +1436,8 @@ export default function Warden() {
                             : "Notify All Absentees via WhatsApp"}
                         </Button>
                       </div>
-                    </div>
-                  ) : null}
+                    );
+                  }, [selectedAttendanceDate, activeDate, students, now, isSendingNotifications])}
                 </CardContent>
               </Card>
             </div>
@@ -1003,7 +1517,7 @@ export default function Warden() {
                       student view.
                     </p>
                   </div>
-                  <Button onClick={handleCreateLogin} className="w-full">
+                  <Button onClick={() => void handleCreateLogin()} className="w-full">
                     <Plus className="mr-2 h-4 w-4" /> Create Login
                   </Button>
                 </CardContent>
@@ -1058,7 +1572,7 @@ export default function Warden() {
                       </div>
                     </div>
                   ) : null}
-                  <Button onClick={handleResetPassword} disabled={!selected}>
+                  <Button onClick={() => void handleResetPassword()} disabled={!selected}>
                     <RefreshCw className="mr-2 h-4 w-4" /> Issue new password
                   </Button>
                 </CardContent>
@@ -1067,6 +1581,60 @@ export default function Warden() {
           </TabsContent>
 
         </Tabs>
+
+        {/* Mobile Bottom Navigation */}
+        <div className="fixed bottom-0 left-0 right-0 z-40 flex md:hidden border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg">
+          <div className="w-full flex divide-x divide-border">
+            <button
+              onClick={() => setActiveTab("access")}
+              className={cn(
+                "flex-1 flex flex-col items-center justify-center gap-1 py-3 px-2 text-xs font-medium transition-colors",
+                activeTab === "access"
+                  ? "text-primary bg-primary/5"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              )}
+            >
+              <Shield className="h-5 w-5" />
+              <span className="line-clamp-1">Access</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("students")}
+              className={cn(
+                "flex-1 flex flex-col items-center justify-center gap-1 py-3 px-2 text-xs font-medium transition-colors",
+                activeTab === "students"
+                  ? "text-primary bg-primary/5"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              )}
+            >
+              <Users className="h-5 w-5" />
+              <span className="line-clamp-1">Students</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("notifications")}
+              className={cn(
+                "flex-1 flex flex-col items-center justify-center gap-1 py-3 px-2 text-xs font-medium transition-colors",
+                activeTab === "notifications"
+                  ? "text-primary bg-primary/5"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              )}
+            >
+              <Bell className="h-5 w-5" />
+              <span className="line-clamp-1">Alerts</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("attendance")}
+              className={cn(
+                "flex-1 flex flex-col items-center justify-center gap-1 py-3 px-2 text-xs font-medium transition-colors",
+                activeTab === "attendance"
+                  ? "text-primary bg-primary/5"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              )}
+            >
+              <Clock className="h-5 w-5" />
+              <span className="line-clamp-1">Clock</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

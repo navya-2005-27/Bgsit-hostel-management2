@@ -1,100 +1,184 @@
-import mongoose, { Schema, InferSchemaType, Model } from "mongoose";
 
-const URI = process.env.MONGODB_URI || "";
 
-let cached = (global as any)._mongooseCached as
-  | { conn: typeof mongoose | null; promise: Promise<typeof mongoose> | null }
-  | undefined;
-if (!cached) {
-  cached = (global as any)._mongooseCached = { conn: null, promise: null };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import sql, { type IResult, type ISqlTypeFactoryWithNoParams } from "mssql";
+
+
+
+
+
+type SqlPoolCache = {
+  pool: sql.ConnectionPool | null;
+  promise: Promise<sql.ConnectionPool> | null;
+};
+
+const globalCache = global as typeof globalThis & {
+  _sqlServerPool?: SqlPoolCache;
+};
+
+const cached: SqlPoolCache = globalCache._sqlServerPool ?? {
+  pool: null,
+  promise: null,
+};
+
+globalCache._sqlServerPool = cached;
+
+function parseBool(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  return value.toLowerCase() === "true";
 }
 
-export async function connectDB() {
-  if (cached!.conn) return cached!.conn;
-  if (!cached!.promise) {
-    if (!URI) throw new Error("MONGODB_URI not set");
-    cached!.promise = mongoose.connect(URI, { dbName: process.env.MONGODB_DB || undefined });
+function getSqlConfig(): sql.config {
+  const connectionString = process.env.SQLSERVER_CONNECTION_STRING?.trim();
+  if (connectionString) {
+    return {
+      connectionString,
+      options: {
+        encrypt: parseBool(process.env.SQLSERVER_ENCRYPT, true),
+        trustServerCertificate: parseBool(
+          process.env.SQLSERVER_TRUST_CERT,
+          true,
+        ),
+      },
+    };
   }
-  cached!.conn = await cached!.promise;
-  return cached!.conn;
+
+  const server = process.env.SQLSERVER_HOST?.trim();
+  const database = process.env.SQLSERVER_DATABASE?.trim();
+  const user = process.env.SQLSERVER_USER?.trim();
+  const password = process.env.SQLSERVER_PASSWORD;
+  const port = Number(process.env.SQLSERVER_PORT || "1433");
+
+  if (!server || !database) {
+    throw new Error(
+      "SQL Server is not configured. Set SQLSERVER_CONNECTION_STRING or SQLSERVER_HOST and SQLSERVER_DATABASE.",
+    );
+  }
+
+  return {
+    server,
+    database,
+    user,
+    password,
+    port,
+    pool: {
+      min: 0,
+      max: 10,
+      idleTimeoutMillis: 30_000,
+    },
+    options: {
+      encrypt: parseBool(process.env.SQLSERVER_ENCRYPT, true),
+      trustServerCertificate: parseBool(process.env.SQLSERVER_TRUST_CERT, true),
+      enableArithAbort: true,
+    },
+  };
 }
 
-// Rooms
-const RoomSchema = new Schema(
-  {
-    roomNumber: { type: String, required: true, index: true, unique: true, trim: true },
-    capacity: { type: Number, required: true, min: 1 },
-    filledCount: { type: Number, required: true, min: 0, default: 0 },
-    occupants: [{ type: Schema.Types.ObjectId, ref: "Student" }],
-  },
-  { timestamps: true },
-);
-export type RoomDoc = InferSchemaType<typeof RoomSchema> & { _id: any };
+export async function connectDB(): Promise<sql.ConnectionPool> {
+  if (cached.pool) return cached.pool;
 
-// Students
-const StudentSchema = new Schema(
-  {
-    rollNumber: { type: String, required: true, unique: true, index: true, trim: true },
-    name: { type: String, required: true, trim: true },
-    password: { type: String, required: true },
-    roomId: { type: Schema.Types.ObjectId, ref: "Room" },
-    // additional profile fields from frontend store
-    parentName: { type: String },
-    parentContact: { type: String },
-    studentContact: { type: String },
-    address: { type: String },
-    email: { type: String },
-    totalAmount: { type: Number },
-    joiningDate: { type: String },
-    profilePhotoDataUrl: { type: String },
-    documents: [{ name: String, dataUrl: String }],
-  },
-  { timestamps: true },
-);
-StudentSchema.index({ name: 1 });
-export type StudentDoc = InferSchemaType<typeof StudentSchema> & { _id: any };
+  if (!cached.promise) {
+    cached.promise = new sql.ConnectionPool(getSqlConfig())
+      .connect()
+      .then((pool) => {
+        cached.pool = pool;
+        return pool;
+      })
+      .catch((error) => {
+        cached.promise = null;
+        throw error;
+      });
+  }
 
-// Parcels
-const ParcelSchema = new Schema(
-  {
-    studentId: { type: Schema.Types.ObjectId, ref: "Student", required: true, index: true },
-    parcelId: { type: String, required: true, trim: true },
-    dateReceived: { type: Date, required: true, default: () => new Date() },
-    collected: { type: Boolean, required: true, default: false },
-    collectedAt: { type: Date },
-    // extra fields used in UI
-    carrier: { type: String },
-    otp: { type: String },
-    note: { type: String },
-  },
-  { timestamps: true },
-);
-ParcelSchema.index({ parcelId: 1 });
-export type ParcelDoc = InferSchemaType<typeof ParcelSchema> & { _id: any };
-
-// Requests (room change/leave)
-const RequestSchema = new Schema(
-  {
-    studentId: { type: Schema.Types.ObjectId, ref: "Student", required: true, index: true },
-    type: { type: String, enum: ["change", "leave"], required: true },
-    status: { type: String, enum: ["pending", "approved", "rejected"], required: true, default: "pending" },
-    targetRoomId: { type: Schema.Types.ObjectId, ref: "Room" },
-    note: { type: String },
-    resolvedAt: { type: Date },
-  },
-  { timestamps: true },
-);
-RequestSchema.index({ status: 1, createdAt: -1 });
-export type RequestDoc = InferSchemaType<typeof RequestSchema> & { _id: any };
-
-export const Room: Model<RoomDoc> = mongoose.models.Room || mongoose.model("Room", RoomSchema);
-export const Student: Model<StudentDoc> = mongoose.models.Student || mongoose.model("Student", StudentSchema);
-export const Parcel: Model<ParcelDoc> = mongoose.models.Parcel || mongoose.model("Parcel", ParcelSchema);
-export const Request: Model<RequestDoc> = mongoose.models.Request || mongoose.model("Request", RequestSchema);
-
-export async function ensureRoomFilledCount(roomId: any) {
-  const r = await Room.findById(roomId).lean();
-  if (!r) return;
-  const cnt = await Student.countDocuments({ roomId });
-  if (r.filledCount !== cnt) await Room.updateOne({ _id: roomId }, { $set: { filledCount: cnt } });
+  return cached.promise;
 }
+
+export async function closeDB(): Promise<void> {
+  if (cached.pool) {
+    await cached.pool.close();
+  }
+  cached.pool = null;
+  cached.promise = null;
+}
+
+export type SqlParam = {
+  name: string;
+  type?: ISqlTypeFactoryWithNoParams;
+  value: unknown;
+};
+
+export async function runQuery<T = unknown>(
+  query: string,
+  params: SqlParam[] = [],
+): Promise<IResult<T>> {
+  const pool = await connectDB();
+  const request = pool.request();
+
+  for (const param of params) {
+    if (param.type) {
+      request.input(param.name, param.type, param.value as any);
+    } else {
+      request.input(param.name, param.value as any);
+    }
+  }
+
+  return request.query<T>(query);
+}
+
+export async function checkDatabaseHealth(): Promise<boolean> {
+  try {
+    await runQuery("SELECT 1 AS ok;");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export { sql };
